@@ -10,18 +10,40 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import random
 import shutil
 import sys
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+DEFAULT_WORKERS = 8
+
+
+def _list_images(root: Path) -> list[Path]:
+    """Return sorted image paths under `root`.
+
+    Args:
+        root: Directory to search recursively.
+
+    Returns:
+        Image paths found beneath `root`, sorted for stable sampling.
+    """
+    images: list[Path] = []
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            if os.path.splitext(name)[1].lower() in IMAGE_EXTENSIONS:
+                images.append(Path(dirpath, name))
+    images.sort()
+    return images
 
 
 def collect_images(
     parent: Path,
     subfolders: Sequence[str] | None = None,
+    workers: int = DEFAULT_WORKERS,
 ) -> dict[str, list[Path]]:
     """Collect image files grouped by first-level subfolder.
 
@@ -30,6 +52,9 @@ def collect_images(
             (for example camera-site folders).
         subfolders: Names of main subfolders to include. If `None`, every
             first-level subfolder under `parent` is considered.
+        workers: Maximum number of threads used to walk subfolders in
+            parallel. Directory listing is I/O-bound, so threads are used
+            rather than processes.
 
     Returns:
         Mapping of each included subfolder name to a sorted list of image
@@ -55,15 +80,17 @@ def collect_images(
         selected = [available[name] for name in sorted(available)]
         include_empty = False
 
+    worker_count = max(1, min(workers, len(selected)))
+    if worker_count == 1:
+        pairs = [(subfolder.name, _list_images(subfolder)) for subfolder in selected]
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            pairs = list(pool.map(lambda path: (path.name, _list_images(path)), selected))
+
     grouped: dict[str, list[Path]] = {}
-    for subfolder in selected:
-        images = sorted(
-            path
-            for path in subfolder.rglob("*")
-            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
-        )
+    for name, images in pairs:
         if images or include_empty:
-            grouped[subfolder.name] = images
+            grouped[name] = images
     return grouped
 
 
@@ -137,10 +164,28 @@ def _sample_equal(
     return selected
 
 
+def _copy_one(source: Path, parent: Path, output: Path) -> tuple[Path, Path]:
+    """Copy one image into `output`, preserving its path relative to `parent`.
+
+    Args:
+        source: Image path to copy.
+        parent: Parent directory used to compute the relative destination.
+        output: Destination directory.
+
+    Returns:
+        The `(source, destination)` pair.
+    """
+    destination = output / source.relative_to(parent)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    return source, destination
+
+
 def copy_images(
     sampled: list[Path],
     parent: Path,
     output: Path,
+    workers: int = DEFAULT_WORKERS,
 ) -> list[tuple[Path, Path]]:
     """Copy sampled images into `output`, preserving relative paths.
 
@@ -148,17 +193,18 @@ def copy_images(
         sampled: Image paths to copy.
         parent: Parent directory used to compute relative destinations.
         output: Destination directory.
+        workers: Maximum number of threads used to copy files in parallel.
 
     Returns:
         Pairs of `(source, destination)` for each copied file.
     """
-    copied: list[tuple[Path, Path]] = []
-    for source in sampled:
-        destination = output / source.relative_to(parent)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
-        copied.append((source, destination))
-    return copied
+    worker_count = max(1, min(workers, len(sampled)))
+    if worker_count == 1:
+        return [_copy_one(source, parent, output) for source in sampled]
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        return list(
+            pool.map(lambda source: _copy_one(source, parent, output), sampled)
+        )
 
 
 def write_manifest(
@@ -286,9 +332,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Print the sample summary without copying files.",
     )
+    parser.add_argument(
+        "--workers",
+        "-w",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=(
+            "Threads for directory scanning and file copies "
+            f"(default: {DEFAULT_WORKERS}). Use 1 to disable parallelism. "
+            "On a NAS, a small value is often faster than a large one."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.n < 1:
         parser.error("--n must be at least 1")
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
     if not args.dry_run and args.output is None:
         parser.error("--output is required unless --dry-run is set")
     return args
@@ -309,8 +368,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Parent folder does not exist or is not a directory: {parent}", file=sys.stderr)
         return 1
 
+    print(f"Scanning images under {parent} ({args.workers} workers)...", flush=True)
     try:
-        grouped = collect_images(parent, args.subfolders)
+        grouped = collect_images(parent, args.subfolders, workers=args.workers)
     except FileNotFoundError as exc:
         print(exc, file=sys.stderr)
         return 1
@@ -339,7 +399,7 @@ def main(argv: list[str] | None = None) -> int:
 
     output = args.output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
-    copied = copy_images(sampled, parent, output)
+    copied = copy_images(sampled, parent, output, workers=args.workers)
     manifest_path = output / "sample_manifest.csv"
     write_manifest(copied, parent, manifest_path)
     print(f"\nCopied {len(copied)} images to {output}")
